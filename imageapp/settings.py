@@ -26,7 +26,7 @@ def _split_csv(env_value: str):
 # Allowed hosts for serving the app. In production, set DJANGO_ALLOWED_HOSTS env variable.
 # For demos, default to '*' to avoid DisallowedHost errors.
 _env_hosts = _split_csv(os.getenv("DJANGO_ALLOWED_HOSTS", ""))
-ALLOWED_HOSTS = _env_hosts or ["*"]
+ALLOWED_HOSTS = ['3.19.103.89','ec2-3-19-103-89.us-east-2.compute.amazonaws.com','localhost','127.0.0.1']
 
 # --- CSRF Trusted Origins ---
 # Builds a list of trusted origins for CSRF protection based on ALLOWED_HOSTS.
@@ -40,7 +40,7 @@ def _csrf_from_hosts(hosts):
         out.append(f"https://{h}")
     return out
 
-CSRF_TRUSTED_ORIGINS = _csrf_from_hosts(ALLOWED_HOSTS)
+CSRF_TRUSTED_ORIGINS = ['http://3.19.103.89','https://3.19.103.89','http://3.19.103.89:8000']
 
 # --- Installed Apps ---
 # Core Django apps plus your custom app (photoapp)
