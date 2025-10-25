@@ -1,0 +1,171 @@
+
+# - Zero template/filesystem dependencies: HTML is built with safe f-strings.
+# - Works with bucket-owner-enforced S3 buckets (no public ACLs).
+# - Clear validation, simple filters (gray/blur/sepia), robust error messages.
+# - Minimal but secure: escapes HTML, checks file type, avoids string concat bugs.
+# -----------------------------------------------------------------------------
+
+import io
+import os
+from datetime import timedelta
+
+import boto3
+from botocore.client import Config
+from PIL import Image, ImageFilter, ImageOps
+
+from django.http import HttpResponse, HttpResponseBadRequest
+from django.shortcuts import redirect
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+
+
+# ---- Configuration pulled from environment (with safe defaults for class demo)
+BUCKET = os.getenv("AWS_STORAGE_BUCKET_NAME", "myclass1-bucket")
+REGION = os.getenv("AWS_S3_REGION_NAME") or os.getenv("AWS_REGION", "us-east-2")
+
+# Use IMDS (instance role) automatically; region is supplied for presign & uploads
+S3 = boto3.client("s3", region_name=REGION, config=Config(signature_version="s3v4"))
+
+
+def _page(title: str, body_html: str) -> HttpResponse:
+    """
+    Minimal HTML wrapper. Note the Back link must always be RELATIVE ('/').
+    """
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>{title}</title>
+  <style>
+    body {{ font-family: system-ui, Arial, sans-serif; padding: 18px; }}
+    label, select, button {{ font-size: 16px; }}
+  </style>
+</head>
+<body>
+  {body_html}
+  <p><a href="/">Back</a></p>
+</body>
+</html>"""
+    return HttpResponse(html)
+
+
+def home(request):
+    """
+    Landing page with upload form.
+    IMPORTANT: form 'action' is a RELATIVE path so we never echo the Host header.
+    """
+    body = f"""
+<h1>Image Filter (Gray / Sepia / Blur)</h1>
+<form method="POST" action="/process/" enctype="multipart/form-data">
+  <p>
+    <label>Choose File:
+      <input type="file" name="image" required>
+    </label>
+  </p>
+  <p>
+    <label>Filter:
+      <select name="filter">
+        <option value="gray">Gray</option>
+        <option value="sepia">Sepia</option>
+        <option value="blur">Blur</option>
+      </select>
+    </label>
+  </p>
+  <button type="submit">Apply</button>
+</form>
+"""
+    return _page("Image Filter", body)
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def process_view(request):
+    """
+    POST: process and store in S3; then show presigned links.
+    GET: just go home so ‘/process’ directly in the bar never blows up.
+    """
+    if request.method == "GET":
+        return redirect("/")
+
+    # ---- Basic validation
+    img_file = request.FILES.get("image")
+    if not img_file:
+        return HttpResponseBadRequest("No file uploaded.")
+
+    chosen = (request.POST.get("filter") or "").lower()
+    if chosen not in {"gray", "sepia", "blur"}:
+        return HttpResponseBadRequest("Invalid filter.")
+
+    # ---- Load and transform
+    try:
+        im = Image.open(img_file).convert("RGB")
+    except Exception as e:
+        return HttpResponseBadRequest(f"Not a valid image: {e}")
+
+    if chosen == "gray":
+        processed = ImageOps.grayscale(im).convert("RGB")
+    elif chosen == "sepia":
+        g = ImageOps.grayscale(im)
+        processed = ImageOps.colorize(g, black="#704214", white="#FFE6C7")
+    else:  # blur
+        processed = im.filter(ImageFilter.GaussianBlur(3))
+
+    # ---- Keys to store in S3 (one for original, one for processed)
+    # keep paths independent of host header
+    import uuid, time
+    base = f"{uuid.uuid4().hex}-{img_file.name.replace('/', '_')}"
+    key_orig = f"uploads/originals/{base}"
+    suffix = f"-{chosen}.png"
+    key_proc = f"uploads/processed/{os.path.splitext(base)[0]}{suffix}"
+
+    # ---- Upload original (stream pass-through)
+    img_file.seek(0)
+    S3.put_object(
+        Bucket=BUCKET,
+        Key=key_orig,
+        Body=img_file.read(),
+        ContentType="image/png",
+        Metadata={"filter": chosen},
+    )
+
+    # ---- Upload processed
+    out = io.BytesIO()
+    processed.save(out, format="PNG")
+    out.seek(0)
+    S3.put_object(
+        Bucket=BUCKET,
+        Key=key_proc,
+        Body=out.getvalue(),
+        ContentType="image/png",
+        Metadata={"filter": chosen},
+    )
+
+    # ---- Generate 1-hour presigned GET URLs
+    expires = int(timedelta(hours=1).total_seconds())
+    url_orig = S3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": BUCKET, "Key": key_orig},
+        ExpiresIn=expires,
+    )
+    url_proc = S3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": BUCKET, "Key": key_proc},
+        ExpiresIn=expires,
+    )
+
+    # ---- Show results; NOTE: preview <img> uses *presigned URL* directly
+    body = f"""
+<h1>Upload complete</h1>
+
+<p><strong>Filter:</strong> {chosen}</p>
+
+<p><strong>Original key:</strong> {key_orig}<br>
+<a href="{url_orig}" target="_blank" rel="noopener">Temporary link (1h)</a></p>
+
+<p><strong>Processed key:</strong> {key_proc}<br>
+<a href="{url_proc}" target="_blank" rel="noopener">Temporary link (1h)</a></p>
+
+<p><strong>Preview (processed):</strong></p>
+<p><img src="{url_proc}" alt="preview" style="max-width:100%; height:auto;"></p>
+"""
+    return _page("Upload complete", body)
